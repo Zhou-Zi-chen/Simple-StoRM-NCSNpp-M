@@ -128,7 +128,10 @@ class OrnsteinUhlenbeckSDE:
                    ((self.sigma_max / self.sigma_min) ** (2 * tau_tensor) - 
                     torch.exp(-2 * self.gamma * tau_tensor)) * 
                     self.log_sigma_ratio / self.const_denom)
-        return torch.sqrt(sigma_sq + 1e-8)
+        # 当tau=0时，公式中的两项抵消，sigma_sq可能接近0
+        
+        # 数值稳定性：确保平方根有效
+        return torch.sqrt(torch.clamp(sigma_sq, min=1e-6))
     
     def sample_perturbed_state(self, x0, y, tau, noise=None):
         if isinstance(tau, (int, float)):
