@@ -57,6 +57,18 @@ class StoRMTrainer:
             betas=(0.9, 0.999)
         )
         
+        # 添加学习率调度器
+        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer,
+            mode='min',
+            factor=0.5,      # 当损失不再下降时，学习率减半
+            patience=3,      # 容忍3个epoch没有改善
+            threshold=0.01,  # 改善阈值
+            threshold_mode='rel',  # 相对改善模式
+            cooldown=0,      # 冷却时间
+            min_lr=1e-6      # 最小学习率
+        )
+
         # EMA（指数移动平均）
         self.ema_model = self._create_ema_model()
         
@@ -103,7 +115,12 @@ class StoRMTrainer:
         
         # 随机采样扩散时间
         time = torch.rand(batch_size, device=self.device)
+        time = torch.clamp(time, min=0.01, max=0.99)  # 避免接近0或1的极端值
         
+        # 用于DeBug
+        # print(f"\n[DEBUG] Batch开始")
+        # print(f"  time范围: [{time.min():.4f}, {time.max():.4f}]")
+
         # 获取判别模型输出
         denoised_stft = self.model.predictive_model(noisy_stft)
         
@@ -119,10 +136,27 @@ class StoRMTrainer:
         
         # 计算噪声水平σ(τ)
         std = self.model.sde.marginal_std(time).view(-1, 1, 1, 1)
+
+        # 用于DeBug
+        # print(f"  std范围: [{std.min():.6f}, {std.max():.6f}]")
+        # print(f"  score范围: [{score.min():.3f}, {score.max():.3f}]")
         
         # 计算分数匹配损失（第二阶段）
-        target = -noise / std  # 根据公式(7)：∇log p = -(xτ - μ)/σ²，而μ = E[xτ]，noise = (xτ - μ)/σ
-        dsm_loss = self.mse_loss(score, target)
+        target = -noise / (std + 1e-6)  # 添加epsilon防止除零  # 根据公式(7)：∇log p = -(xτ - μ)/σ²，而μ = E[xτ]，noise = (xτ - μ)/σ
+        
+        # 用于DeBug
+        # print(f"  target范围: [{target.min():.3f}, {target.max():.3f}]")  ## 实测发现target范围很大
+        # print(f"  noise范围: [{noise.min():.3f}, {noise.max():.3f}]")
+        
+        # 权重函数 λ(t) = std² 或 1/std²，根据具体推导
+        # 对于去噪分数匹配，常用 λ(t) = std²
+        weight = std**2
+        
+        # 加权损失
+        weighted_score = score * weight
+        weighted_target = target * weight
+        
+        dsm_loss = self.mse_loss(weighted_score, weighted_target) / (weight.mean() + 1e-8)
         
         # 总损失
         total_loss = self.alpha * supervised_loss + dsm_loss
@@ -156,8 +190,14 @@ class StoRMTrainer:
             loss_dict['total'].backward()
             
             # 梯度裁剪
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            total_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0, norm_type=2)
             
+            # 如果梯度范数过大，额外处理
+            if total_norm > 10.0:  # 梯度范数超过10
+                print(f"警告: 梯度范数过大: {total_norm:.2f}")
+                # 进一步裁剪
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)
+
             # 优化器步骤
             self.optimizer.step()
             
@@ -173,7 +213,8 @@ class StoRMTrainer:
             pbar.set_postfix({
                 'total': f'{loss_dict["total"].item():.4f}',
                 'sup': f'{loss_dict["supervised"].item():.4f}',
-                'dsm': f'{loss_dict["dsm"].item():.4f}'
+                'dsm': f'{loss_dict["dsm"].item():.4f}',
+                'grad_norm': f'{total_norm:.2f}'  # 显示梯度范数
             })
             
             # 定期保存检查点
