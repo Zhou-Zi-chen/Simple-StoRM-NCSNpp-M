@@ -185,3 +185,84 @@ class STFTProcessor:
         imag_warped = magnitude_warped * torch.sin(phase)
         
         return torch.cat([real_warped, imag_warped], dim=1)
+    
+class PCSampler:
+    """预测器-校正器采样器"""
+    
+    def __init__(self, num_steps=50, corrector_steps=1, r=0.5, method='euler'):
+        """
+        初始化采样器
+        Args:
+            num_steps: 时间步数 (N=50)
+            corrector_steps: 校正器步数 (1)
+            r: 步长参数 (0.5)
+            method: 预测器方法 ('euler', 'heun')
+        """
+        self.num_steps = num_steps
+        self.corrector_steps = corrector_steps
+        self.r = r
+        self.method = method
+        self.dt = 1.0 / num_steps
+    
+    def predictor_step(self, model, x, denoised_stft, noisy_stft, t):
+        """
+        预测器步骤（欧拉-丸山）
+        """
+        # 获取分数估计
+        t_tensor = torch.ones(x.shape[0], device=x.device) * t
+        score = model.diffusion_model(x, noisy_stft, denoised_stft, t_tensor)
+        
+        # 计算漂移项
+        drift = model.sde.drift(x, denoised_stft)
+        g_t = model.sde.g(t)
+        
+        # 欧拉-丸山更新
+        dx = (-drift + g_t**2 * score) * self.dt
+        x_pred = x + dx
+        
+        return x_pred, score, g_t
+    
+    def corrector_step(self, model, x, denoised_stft, noisy_stft, t, score, g_t):
+        """
+        校正器步骤（退火朗之万动力学）
+        """
+        x_corr = x
+        
+        for _ in range(self.corrector_steps):
+            # 重新估计分数
+            t_corr = torch.ones(x_corr.shape[0], device=x_corr.device) * (t - self.dt/2)
+            score_corr = model.diffusion_model(x_corr, noisy_stft, denoised_stft, t_corr)
+            
+            # 朗之万动力学更新
+            step_size = self.r * (g_t * torch.sqrt(torch.tensor(2 * self.dt, device=g_t.device)))**2
+            noise = torch.randn_like(x_corr)
+            
+            x_corr = x_corr + step_size * score_corr + torch.sqrt(2 * step_size) * noise
+        
+        return x_corr
+    
+    def sample(self, model, x_init, denoised_stft, noisy_stft):
+        """
+        执行完整的预测器-校正器采样
+        """
+        x = x_init
+        
+        for i in range(self.num_steps):
+            t = 1.0 - i * self.dt  # 从1到0
+            
+            # ===== 预测器步骤 =====
+            x_pred, score, g_t = self.predictor_step(model, x, denoised_stft, noisy_stft, t)
+            
+            # 添加噪声（除了最后一步）
+            if i < self.num_steps - 1:
+                noise = torch.randn_like(x_pred)
+                x_pred = x_pred + g_t * torch.sqrt(torch.tensor(2 * self.dt, device=g_t.device)) * noise
+            
+            # ===== 校正器步骤 =====
+            if self.corrector_steps > 0:
+                x_corr = self.corrector_step(model, x_pred, denoised_stft, noisy_stft, t, score, g_t)
+                x = x_corr
+            else:
+                x = x_pred
+        
+        return x

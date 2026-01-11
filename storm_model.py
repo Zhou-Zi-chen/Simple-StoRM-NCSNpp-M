@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 from predictive_model import PredictiveModel
 from diffusion_model import StoRMDiffusionModel, OrnsteinUhlenbeckSDE
+from base_components import PCSampler
 
 class StoRMModel(nn.Module):
     """
@@ -27,6 +28,21 @@ class StoRMModel(nn.Module):
         self.gamma = 1.5
         self.T = 1.0
         self.condition_dim = condition_dim
+
+        # 添加采样器配置
+        self.num_steps = 50  # 反向扩散步数 N=50
+        self.corrector_steps = 1  # 校正器步数
+        self.r = 0.5  # 步长参数
+        
+        # 创建采样器
+        self.sampler = PCSampler(
+            num_steps=self.num_steps,
+            corrector_steps=self.corrector_steps,
+            r=self.r,
+            method='euler'
+        )
+        
+        print(f"采样配置: N={self.num_steps}, 校正器步数={self.corrector_steps}, r={self.r}")
         
     def forward(self, noisy_stft, time=None, x0=None, return_intermediate=False):
         batch_size = noisy_stft.shape[0]
@@ -67,10 +83,16 @@ class StoRMModel(nn.Module):
         else:
             return score
     
-    def enhance(self, noisy_stft, num_steps=50, denoise_only=False):
+    def enhance(self, noisy_stft, num_steps=50, denoise_only=False, use_pc_sampler=True):
         """
         增强推理函数
+        Args:
+            noisy_stft: 噪声STFT
+            num_steps: 时间步数（如果为None，使用默认配置）
+            denoise_only: 是否只使用判别模型
+            use_pc_sampler: 是否使用预测器-校正器采样
         """
+
         self.eval()
         
         with torch.no_grad():
@@ -87,31 +109,51 @@ class StoRMModel(nn.Module):
             # 从先验采样初始状态
             time_T = torch.ones(batch_size, device=device) * self.T
             std_T = self.sde.marginal_std(time_T).view(-1, 1, 1, 1)
-            x = denoised_stft + std_T * torch.randn_like(denoised_stft)
+            x_init = denoised_stft + std_T * torch.randn_like(denoised_stft)
             
-            # 反向扩散过程
-            dt = self.T / num_steps
-            
-            for i in range(num_steps):
-                t = self.T - i * dt
-                t_tensor = torch.ones(batch_size, device=device) * t
+            if use_pc_sampler and hasattr(self, 'sampler'):
+                # ===== 使用预测器-校正器采样 =====
+                print(f"使用预测器-校正器采样: N={self.sampler.num_steps}")
                 
-                # 预测分数
-                score = self.diffusion_model(x, noisy_stft, denoised_stft, t_tensor)
+                # 如果需要覆盖默认步数
+                if num_steps is not None:
+                    temp_sampler = PCSampler(
+                        num_steps=num_steps,
+                        corrector_steps=self.corrector_steps,
+                        r=self.r,
+                        method='euler'
+                    )
+                    x = temp_sampler.sample(self, x_init, denoised_stft, noisy_stft)
+                else:
+                    x = self.sampler.sample(self, x_init, denoised_stft, noisy_stft)
+            else:
+                # ===== 使用原始的欧拉-丸山方法 =====
+                print("使用欧拉-丸山采样")
                 
-                # 更新步骤
-                drift = self.sde.drift(x, denoised_stft)
-                g_t = self.sde.g(t)
+                num_steps = num_steps or self.num_steps
+                dt = self.T / num_steps
                 
-                # 反向SDE
-                dx = (-drift + g_t**2 * score) * dt
-                x = x + dx
+                x = x_init
                 
-                # 添加噪声（除了最后一步）
-                if i < num_steps - 1:
-                    noise = torch.randn_like(x)
-                    dt_tensor = torch.tensor(dt, device=device)
-                    x = x + g_t * torch.sqrt(2 * dt_tensor) * noise
+                for i in range(num_steps):
+                    t = self.T - i * dt
+                    t_tensor = torch.ones(batch_size, device=device) * t
+                    
+                    # 预测分数
+                    score = self.diffusion_model(x, noisy_stft, denoised_stft, t_tensor)
+                    
+                    # 更新步骤
+                    drift = self.sde.drift(x, denoised_stft)
+                    g_t = self.sde.g(t)
+                    
+                    # 反向SDE
+                    dx = (-drift + g_t**2 * score) * dt
+                    x = x + dx
+                    
+                    # 添加噪声（除了最后一步）
+                    if i < num_steps - 1:
+                        noise = torch.randn_like(x)
+                        x = x + g_t * torch.sqrt(torch.tensor(2 * dt, device=g_t.device)) * noise
             
             return x
     
@@ -129,15 +171,50 @@ class StoRMModel(nn.Module):
 
 
 def test_storm_model_fixed():
-    """修正后的测试函数"""
+    """修正后的测试函数 - 包含采样器测试"""
     
     print("=" * 60)
-    print("StoRM模型测试 - 修正版")
+    print("StoRM模型测试 - 包含预测器-校正器采样")
     print("=" * 60)
     
     # 创建模型
     model = StoRMModel(base_channels=32, condition_dim=256)
     
+    # 测试不同采样方法
+    test_cases = [
+        {'use_pc_sampler': True, 'num_steps': 50, 'name': 'PC采样器 (N=50)'},
+        {'use_pc_sampler': False, 'num_steps': 50, 'name': '欧拉-丸山 (N=50)'},
+        {'use_pc_sampler': True, 'num_steps': 20, 'name': 'PC采样器 (N=20)'},
+        {'use_pc_sampler': False, 'num_steps': 20, 'name': '欧拉-丸山 (N=20)'},
+    ]
+    
+    # 测试输入
+    batch_size = 1
+    freq_bins = 128
+    time_frames = 128
+    noisy_stft = torch.randn(batch_size, 2, freq_bins, time_frames)
+    
+    for config in test_cases:
+        print(f"\n测试配置: {config['name']}")
+        
+        try:
+            model.eval()
+            with torch.no_grad():
+                enhanced = model.enhance(
+                    noisy_stft, 
+                    num_steps=config['num_steps'],
+                    denoise_only=False,
+                    use_pc_sampler=config['use_pc_sampler']
+                )
+                print(f"  输入形状: {noisy_stft.shape}")
+                print(f"  输出形状: {enhanced.shape}")
+                print(f"  ✓ 测试通过")
+                
+        except Exception as e:
+            print(f"  ✗ 测试失败: {e}")
+            import traceback
+            traceback.print_exc()
+
     # 测试不同尺寸 - 确保尺寸能被8整除
     test_cases = [
         (1, 128, 128),   # 小尺寸
