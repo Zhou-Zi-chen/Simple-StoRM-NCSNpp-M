@@ -104,7 +104,7 @@ class StoRMTrainer:
     
     def _create_ema_model(self):
         """创建EMA模型"""
-        ema_model = StoRMModel(base_channels=32).to(self.device)
+        ema_model = StoRMModel(base_channels=32, condition_dim=256, verbose=False).to(self.device)
         ema_model.load_state_dict(self.model.state_dict())
         ema_model.eval()
         return ema_model
@@ -202,9 +202,13 @@ class StoRMTrainer:
         avg_loss = total_loss / len(self.test_loader)
         return {'val_loss':avg_loss, 'loss': avg_loss}
 
-    def pretrain_predictive_model(self, max_epochs=50, patience=5, min_delta=0.001):
+    def pretrain_predictive_model(self, max_epochs=50, patience=5, min_delta=0.001, start_epoch=0):
         """预训练预测模型，带早停机制"""
         print(f"\n开始预训练预测模型，最多 {max_epochs} 个epoch")
+
+        if start_epoch > 0:
+            print(f"从epoch {start_epoch}继续训练")
+
         self.training_phase = 'pretrain_predictor'
         
         # 创建预测模型专用的优化器
@@ -227,7 +231,7 @@ class StoRMTrainer:
         patience_counter = 0
         best_model_state = None
         
-        for epoch in range(max_epochs):
+        for epoch in range(start_epoch, max_epochs):  # 从start_epoch开始
             # 训练一个epoch
             train_result = self._train_predictive_epoch()
             
@@ -617,11 +621,15 @@ def main():
     parser.add_argument('--n_fft', type=int, default=510,
                         help='STFT的FFT点数')
     
+    # ===== 恢复训练参数 =====
+    parser.add_argument('--resume_pretrained', type=str, default=None,
+                        help='加载预训练的预测模型')
+    parser.add_argument('--resume_joint', type=str, default=None,
+                        help='加载联合训练模型继续训练')
+
     # 其他参数
     parser.add_argument('--device', type=str, default='cpu',
                         help='设备（cpu/mps/cuda）')
-    parser.add_argument('--resume', type=str, default=None,
-                        help='从检查点恢复训练')
     parser.add_argument('--test_only', action='store_true',
                         help='仅测试模式')
     
@@ -652,7 +660,7 @@ def main():
     
     # 创建模型
     print("\n创建模型...")
-    model = StoRMModel(base_channels=args.base_channels)
+    model = StoRMModel(base_channels=args.base_channels, verbose=True)
     
     # 创建训练器
     trainer = StoRMTrainer(
@@ -664,11 +672,6 @@ def main():
         alpha=args.alpha,
         ema_decay=args.ema_decay
     )
-    
-    # 恢复检查点（如果有）
-    if args.resume:
-        print(f"\n从检查点恢复: {args.resume}")
-        trainer.load_checkpoint(args.resume)
     
     # 测试模式
     if args.test_only:
@@ -685,12 +688,29 @@ def main():
             checkpoint = torch.load(args.resume_pretrained, map_location=args.device)
             model.predictive_model.load_state_dict(checkpoint['model'])
             print(f"加载预训练模型: {args.resume_pretrained}")
+                    
+            # 获取之前的训练信息（如果有）
+            previous_epoch = checkpoint.get('epoch', 0)
+            best_loss = checkpoint.get('loss', float('inf'))
+            
+            print(f"  之前训练到epoch: {previous_epoch}")
+            print(f"  最佳验证损失: {best_loss:.4f}")
+            
+            # 继续预训练
+            trainer.pretrain_predictive_model(
+                max_epochs=args.pretrain_epochs,  # 新的总epoch数
+                patience=args.pretrain_patience,
+                start_epoch=previous_epoch  # 从之前的epoch继续
+            )
         else:
             # 从头开始预训练
             trainer.pretrain_predictive_model(
                 max_epochs=args.pretrain_epochs,
                 patience=args.pretrain_patience
             )
+
+    else:
+        print("✓ 跳过预训练（因为 no_pretrain=True）")
     
     # ===== 阶段2: 联合训练 =====
     if args.resume_joint:
@@ -698,11 +718,21 @@ def main():
         trainer.load_checkpoint(args.resume_joint)
     
     # 开始联合训练
-    history = trainer.train(
-        num_epochs=args.joint_epochs,
-        pretrain_epochs=args.joint_patience,
-        save_every=10
-    )
+    if args.resume_joint or args.no_pretrain:
+        # 情况1: 恢复联合训练 或 跳过预训练
+        # 设置 pretrain_epochs=0 确保不进行预训练
+        history = trainer.train(
+            num_epochs=args.joint_epochs,
+            pretrain_epochs=0,
+            save_every=10
+        )
+    else:
+        # 情况2: 完整训练（包含预训练）
+        history = trainer.train(
+            num_epochs=args.joint_epochs,
+            pretrain_epochs=args.pretrain_epochs,
+            save_every=10
+        )
     
     print(f"\n训练完成!")
     
@@ -787,7 +817,7 @@ def test_inference():
 
 if __name__ == "__main__":
     # 测试推理
-    test_inference()
+    # test_inference()
     
     # 如果需要训练，取消注释下面的行
     main()
